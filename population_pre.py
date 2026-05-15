@@ -1,3 +1,34 @@
+"""
+ARTI 406 – Machine Learning Project
+Predicting Hospital Bed Demand Based on Population Growth in Saudi Arabia
+Group 6
+
+population_pre.py  –  Data Loading, Cleaning, EDA, and Population Forecasting
+===============================================================================
+
+Datasets:
+  1. Population_2010_-_2022.csv
+  2. Number_of_hospital_beds_per_1_000_population.csv
+  3. Hospital_beds_in_the_government_sector_by_...specialty.csv
+  4. Number_of_hospitals_per_10_000_population.csv
+
+Population forecasting method: Linear Regression (per region, Year → Population)
+  - Justified: 13-year trends are smooth and near-linear; simple and interpretable
+  - Train on 2010–2019, evaluate on 2020–2022, then forecast 2023–2030
+
+Model comparison (for population step):
+  - LinearRegression  → strong baseline, interpretable
+  - Ridge             → handles slight multicollinearity
+  - XGBoost           → cited in literature, best on tabular data
+
+Output files:
+  - population_cleaned.csv
+  - population_forecast_2023_2030.csv
+  - merged_dataset.csv   (population + all bed metrics, ready for bed demand model)
+  - model_evaluation_population.csv
+  - Several EDA and forecast plots (*.png)
+"""
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -5,151 +36,254 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── 1. LOAD & INSPECT ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 – LOAD ALL DATASETS
+# ─────────────────────────────────────────────────────────────────────────────
 
-df = pd.read_csv("poulation.csv", encoding="utf-8")
+def load(path):
+    """Load a utf-16 tab-separated CSV, strip whitespace from column names."""
+    df = pd.read_csv(path, encoding="utf-16", sep="\t")
+    df.columns = df.columns.str.strip()
+    return df
+pop_raw        = load("DataSets/Population 2010 - 2022.csv")
+beds_per_1000  = load("DataSets/Number of hospital beds per 1,000 population.csv")
+beds_specialty = load("DataSets/Hospital beds in the government sector by administrative region and specialty.csv")
+hosp_per_10000 = load("DataSets/Number of hospitals per 10,000 population.csv")
 
-# Rename Arabic columns to English for easier coding
-df.columns = ["Nationality", "Year", "Region", "Gender", "Population"]
+print("=" * 60)
+print("DATASET OVERVIEW")
+print("=" * 60)
+for name, df in [("Population", pop_raw), ("Beds/1000", beds_per_1000),
+                 ("Beds by Specialty", beds_specialty), ("Hospitals/10000", hosp_per_10000)]:
+    print(f"\n{name}: {df.shape[0]} rows x {df.shape[1]} cols")
+    print("  Columns:", list(df.columns))
 
-print("Shape:", df.shape)
-print("\nColumn dtypes:\n", df.dtypes)
-print("\nFirst rows:")
-print(df.head())
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 – CLEAN POPULATION DATA
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── 2. BASIC CLEANING ────────────────────────────────────────────────────────
+# Drop the "Total" summary row
+pop = pop_raw[pop_raw["Region"].str.strip() != "Total"].copy()
 
-# Check for nulls
-null_counts = df.isnull().sum()
-print("\nNull values per column:\n", null_counts)
+# Year columns contain comma-formatted numbers (e.g. "6,224,033") → convert to int
+year_cols = [str(y) for y in range(2010, 2023)]
+for col in year_cols:
+    pop[col] = pop[col].astype(str).str.replace(",", "").str.strip()
+    pop[col] = pd.to_numeric(pop[col], errors="coerce")
 
-# Check for duplicates
-dup_count = df.duplicated().sum()
-print(f"\nDuplicate rows: {dup_count}")
+pop["Region"] = pop["Region"].str.strip()
 
-# Ensure Population is numeric
-df["Population"] = pd.to_numeric(df["Population"], errors="coerce")
+print("\n\nPOPULATION DATA (cleaned wide format):")
+print(pop.to_string(index=False))
+print("\nNull values:", pop.isnull().sum().sum())
 
-# Drop any rows where Population couldn't be parsed
-df.dropna(subset=["Population"], inplace=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 – RESHAPE TO LONG FORMAT (for ML)
+# ─────────────────────────────────────────────────────────────────────────────
 
-print(f"\nYear range: {df['Year'].min()} – {df['Year'].max()}")
-print(f"Regions ({df['Region'].nunique()}):\n", df["Region"].unique())
-print(f"\nNationality categories: {df['Nationality'].unique()}")
-print(f"Gender categories:      {df['Gender'].unique()}")
+pop_long = pop.melt(id_vars="Region", value_vars=year_cols,
+                    var_name="Year", value_name="Population")
+pop_long["Year"] = pop_long["Year"].astype(int)
+pop_long = pop_long.sort_values(["Region", "Year"]).reset_index(drop=True)
 
-# ── 3. AGGREGATE: Total population per Region per Year ───────────────────────
-# (sum across Nationality and Gender — we want total regional population)
+print("\n\nPOPULATION LONG FORMAT (first 20 rows):")
+print(pop_long.head(20).to_string(index=False))
 
-region_year = (
-    df.groupby(["Region", "Year"], as_index=False)["Population"]
-    .sum()
-    .rename(columns={"Population": "Total_Population"})
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 – CLEAN HEALTHCARE DATASETS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Standardise region names to match population dataset
+REGION_MAP = {
+    "Riyadh":           "Ar Riyadh",
+    "Makkah":           "Makkah Al Mukarramah",
+    "Madinah":          "Al Madinah Al Munawwarah",
+    "Qassim":           "Al Qaseem",
+    "Eastern Region":   "Eastern Region",
+    "Aseer":            "Aseer",
+    "Tabuk":            "Tabuk",
+    "Hail":             "Hail",
+    "Northern Borders": "Northern Borders",
+    "Jazan":            "Jazan",
+    "Najran":           "Najran",
+    "Al-Baha":          "Al Bahah",
+    "Al-Jouf":          "Al Jawf",
+}
+
+def clean_healthcare_df(df):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    df["Administrative Area"] = df["Administrative Area"].str.strip()
+    df = df[~df["Administrative Area"].isin(["Total", "Other"])]
+    df["Region"] = df["Administrative Area"].map(REGION_MAP)
+    unmapped = df[df["Region"].isna()]["Administrative Area"].unique()
+    if len(unmapped):
+        print(f"  Warning - unmapped regions: {unmapped}")
+    df = df.dropna(subset=["Region"])
+    return df
+
+# Beds per 1,000
+b1000 = clean_healthcare_df(beds_per_1000)
+b1000["Beds_per_1000"] = pd.to_numeric(b1000["Number"], errors="coerce")
+b1000 = b1000[["Region", "Beds_per_1000"]]
+print("\n\nBEDS PER 1,000 POPULATION (cleaned):")
+print(b1000.to_string(index=False))
+
+# Hospitals per 10,000
+h10000 = clean_healthcare_df(hosp_per_10000)
+h10000["Hospitals_per_10000"] = pd.to_numeric(h10000["Number"], errors="coerce")
+h10000 = h10000[["Region", "Hospitals_per_10000"]]
+print("\n\nHOSPITALS PER 10,000 POPULATION (cleaned):")
+print(h10000.to_string(index=False))
+
+# Beds by specialty — some cells contain "-" (zero beds)
+spec = clean_healthcare_df(beds_specialty)
+spec_num_cols = [
+    "Internal", "surgical", "Orthopedics", "Urology", "Oral and Dental",
+    "Obstetrics and gynecology", "Pediatrics", "Intensive care",
+    "Otorhinolaryngology (ENT)", "Springs", "Chest/Respiratory Diseases",
+    "Dermatology and Venereology", "Burns and Plastic Surgery",
+    "Psychiatry and Neurology", "Isolation", "Other", "Total"
+]
+for col in spec_num_cols:
+    spec[col] = (spec[col].astype(str)
+                           .str.replace(",", "")
+                           .str.strip()
+                           .replace("-", "0"))
+    spec[col] = pd.to_numeric(spec[col], errors="coerce").fillna(0).astype(int)
+
+spec = spec[["Region"] + spec_num_cols].rename(columns={"Total": "Total_Beds"})
+print("\n\nBEDS BY SPECIALTY (cleaned, first 5 rows):")
+print(spec.head().to_string(index=False))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 – FEATURE ENGINEERING ON POPULATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+pop_long = pop_long.sort_values(["Region", "Year"])
+
+# Year-over-year absolute change
+pop_long["Pop_change"] = pop_long.groupby("Region")["Population"].diff()
+
+# Year-over-year growth rate (%)
+pop_long["Growth_rate_pct"] = (
+    pop_long.groupby("Region")["Population"].pct_change() * 100
 )
 
-print("\nAggregated shape:", region_year.shape)
-print(region_year.head(10))
+# Cumulative growth since 2010
+base = pop_long[pop_long["Year"] == 2010][["Region", "Population"]].rename(
+    columns={"Population": "Pop_2010"}
+)
+pop_long = pop_long.merge(base, on="Region", how="left")
+pop_long["Cumulative_growth_pct"] = (
+    (pop_long["Population"] - pop_long["Pop_2010"]) / pop_long["Pop_2010"] * 100
+)
 
-# ── 4. EXPLORATORY DATA ANALYSIS ─────────────────────────────────────────────
+print("\n\nPOPULATION WITH ENGINEERED FEATURES (first 15 rows):")
+print(pop_long.head(15).to_string(index=False))
 
-regions = region_year["Region"].unique()
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 – EDA VISUALISATIONS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# 4a. Population trend per region
-fig, axes = plt.subplots(4, 4, figsize=(20, 16))
+regions = sorted(pop_long["Region"].unique())
+palette = sns.color_palette("tab10", len(regions))
+
+# 6a. Population trend per region (grid)
+fig, axes = plt.subplots(4, 4, figsize=(22, 16))
 axes = axes.flatten()
-
 for i, region in enumerate(regions):
-    sub = region_year[region_year["Region"] == region]
-    axes[i].plot(sub["Year"], sub["Total_Population"] / 1e6, marker="o", linewidth=2)
-    axes[i].set_title(region, fontsize=10)
-    axes[i].set_xlabel("Year")
-    axes[i].set_ylabel("Population (M)")
+    sub = pop_long[pop_long["Region"] == region]
+    axes[i].plot(sub["Year"], sub["Population"] / 1e6, marker="o",
+                 linewidth=2, color=palette[i])
+    axes[i].set_title(region, fontsize=9, fontweight="bold")
+    axes[i].set_xlabel("Year", fontsize=8)
+    axes[i].set_ylabel("Population (M)", fontsize=8)
     axes[i].grid(True, alpha=0.3)
-
-# Hide unused subplots
+    axes[i].tick_params(labelsize=7)
 for j in range(len(regions), len(axes)):
     axes[j].set_visible(False)
-
-plt.suptitle("Population Trend by Region (2010–2022)", fontsize=14, fontweight="bold")
+plt.suptitle("Population Trend by Region (2010-2022)", fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.savefig("eda_population_trends.png", dpi=120, bbox_inches="tight")
 plt.close()
 print("\nSaved: eda_population_trends.png")
 
-# 4b. Saudi vs Non-Saudi breakdown
-nat_year = (
-    df.groupby(["Nationality", "Year"], as_index=False)["Population"]
-    .sum()
-)
-
-plt.figure(figsize=(10, 5))
-for nat, grp in nat_year.groupby("Nationality"):
-    plt.plot(grp["Year"], grp["Population"] / 1e6, marker="o", label=nat, linewidth=2)
-plt.title("Saudi vs Non-Saudi Population (All Regions Combined)")
+# 6b. All regions overlaid
+plt.figure(figsize=(13, 6))
+for i, region in enumerate(regions):
+    sub = pop_long[pop_long["Region"] == region]
+    plt.plot(sub["Year"], sub["Population"] / 1e6, marker="o",
+             linewidth=1.8, label=region, color=palette[i])
+plt.title("Population Growth - All Regions (2010-2022)", fontsize=13, fontweight="bold")
 plt.xlabel("Year")
 plt.ylabel("Population (Millions)")
-plt.legend()
+plt.legend(fontsize=7, ncol=2)
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig("eda_nationality_breakdown.png", dpi=120, bbox_inches="tight")
+plt.savefig("eda_all_regions_overlay.png", dpi=120, bbox_inches="tight")
 plt.close()
-print("Saved: eda_nationality_breakdown.png")
+print("Saved: eda_all_regions_overlay.png")
 
-# 4c. Gender breakdown
-gender_year = (
-    df.groupby(["Gender", "Year"], as_index=False)["Population"]
-    .sum()
-)
+# 6c. 2022 population bar chart
+pop_2022 = pop_long[pop_long["Year"] == 2022].sort_values("Population")
+fig, ax = plt.subplots(figsize=(12, 7))
+bars = ax.barh(pop_2022["Region"], pop_2022["Population"] / 1e6,
+               color=sns.color_palette("Blues_d", len(pop_2022)))
+ax.set_xlabel("Population (Millions)", fontsize=11)
+ax.set_title("Total Population by Region - 2022", fontsize=13, fontweight="bold")
+for bar, val in zip(bars, pop_2022["Population"] / 1e6):
+    ax.text(bar.get_width() + 0.03, bar.get_y() + bar.get_height() / 2,
+            f"{val:.2f}M", va="center", fontsize=8)
+plt.tight_layout()
+plt.savefig("eda_population_2022_bar.png", dpi=120, bbox_inches="tight")
+plt.close()
+print("Saved: eda_population_2022_bar.png")
 
-plt.figure(figsize=(10, 5))
-for gender, grp in gender_year.groupby("Gender"):
-    plt.plot(grp["Year"], grp["Population"] / 1e6, marker="o", label=gender, linewidth=2)
-plt.title("Male vs Female Population (All Regions Combined)")
-plt.xlabel("Year")
-plt.ylabel("Population (Millions)")
-plt.legend()
+# 6d. Growth rate heatmap
+growth_pivot = pop_long.pivot(index="Region", columns="Year", values="Growth_rate_pct")
+plt.figure(figsize=(14, 7))
+sns.heatmap(growth_pivot, annot=True, fmt=".1f", cmap="RdYlGn",
+            linewidths=0.5, center=0, cbar_kws={"label": "YoY Growth (%)"})
+plt.title("Year-over-Year Population Growth Rate (%) by Region", fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.savefig("eda_growth_rate_heatmap.png", dpi=120, bbox_inches="tight")
+plt.close()
+print("Saved: eda_growth_rate_heatmap.png")
+
+# 6e. Beds per 1000 vs hospitals per 10000 scatter
+merged_health = b1000.merge(h10000, on="Region")
+plt.figure(figsize=(10, 6))
+for _, row in merged_health.iterrows():
+    plt.scatter(row["Hospitals_per_10000"], row["Beds_per_1000"], s=100, zorder=3)
+    plt.annotate(row["Region"], (row["Hospitals_per_10000"], row["Beds_per_1000"]),
+                 fontsize=7, ha="left", xytext=(4, 2), textcoords="offset points")
+plt.xlabel("Hospitals per 10,000 Population")
+plt.ylabel("Beds per 1,000 Population")
+plt.title("Healthcare Infrastructure: Hospitals vs Beds per Capita", fontsize=12, fontweight="bold")
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig("eda_gender_breakdown.png", dpi=120, bbox_inches="tight")
+plt.savefig("eda_beds_vs_hospitals.png", dpi=120, bbox_inches="tight")
 plt.close()
-print("Saved: eda_gender_breakdown.png")
+print("Saved: eda_beds_vs_hospitals.png")
 
-# 4d. 2022 population bar chart by region
-pop_2022 = region_year[region_year["Year"] == 2022].sort_values("Total_Population", ascending=True)
-plt.figure(figsize=(12, 7))
-plt.barh(pop_2022["Region"], pop_2022["Total_Population"] / 1e6, color="steelblue")
-plt.xlabel("Population (Millions)")
-plt.title("Total Population by Region – 2022")
+# 6f. Specialty bed distribution stacked bar
+spec_plot = spec.set_index("Region")
+specialty_cols = [c for c in spec_num_cols if c not in ["Total", "Other", "Total_Beds"]]
+spec_plot[specialty_cols].plot(kind="bar", stacked=True, figsize=(14, 7), colormap="tab20")
+plt.title("Hospital Beds by Specialty per Region (Government Sector)", fontsize=12, fontweight="bold")
+plt.xlabel("Region")
+plt.ylabel("Number of Beds")
+plt.xticks(rotation=45, ha="right", fontsize=8)
+plt.legend(loc="upper right", fontsize=7, ncol=2)
 plt.tight_layout()
-plt.savefig("eda_population_2022.png", dpi=120, bbox_inches="tight")
+plt.savefig("eda_specialty_beds_stacked.png", dpi=120, bbox_inches="tight")
 plt.close()
-print("Saved: eda_population_2022.png")
+print("Saved: eda_specialty_beds_stacked.png")
 
-# ── 5. FEATURE ENGINEERING ───────────────────────────────────────────────────
-
-# Encode region as a numeric label for ML models
-from sklearn.preprocessing import LabelEncoder
-
-le = LabelEncoder()
-region_year["Region_encoded"] = le.fit_transform(region_year["Region"])
-
-# Add growth-rate feature (year-over-year % change per region)
-region_year = region_year.sort_values(["Region", "Year"])
-region_year["Population_lag1"] = region_year.groupby("Region")["Total_Population"].shift(1)
-region_year["Growth_rate"] = (
-    (region_year["Total_Population"] - region_year["Population_lag1"])
-    / region_year["Population_lag1"]
-) * 100
-
-# Fill NaN growth rate for first year of each region with the region's mean growth
-region_year["Growth_rate"] = region_year.groupby("Region")["Growth_rate"].transform(
-    lambda x: x.fillna(x.mean())
-)
-
-print("\nFeature-engineered dataset:")
-print(region_year.head(15))
-
-# ── 6. POPULATION FORECASTING (2023–2030) ────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 – POPULATION FORECASTING (2023–2030)
+# ─────────────────────────────────────────────────────────────────────────────
 
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
@@ -158,115 +292,167 @@ try:
     from xgboost import XGBRegressor
     HAS_XGB = True
 except ImportError:
-    print("\nNote: xgboost not installed. Run: pip install xgboost")
+    print("\nNote: xgboost not installed (pip install xgboost). Skipping XGBoost.")
     HAS_XGB = False
 
-future_years_list = [2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030]
+FUTURE_YEARS  = list(range(2023, 2031))
+TRAIN_CUTOFF  = 2019  # train 2010-2019, test 2020-2022
 
-# Train one model per region (using Year as the only feature for forecasting)
-# For full ML pipeline (with bed data), Region_encoded + Growth_rate will be used too.
+results_rows  = []
+all_forecasts = []
 
-all_preds = []
-
-print("\n── Per-region model evaluation (train 2010–2019, test 2020–2022) ──\n")
+print("\n\n" + "=" * 60)
+print("POPULATION FORECASTING - MODEL EVALUATION PER REGION")
+print(f"  Train: 2010-{TRAIN_CUTOFF}  |  Test: {TRAIN_CUTOFF+1}-2022")
+print("=" * 60)
 
 for region in regions:
-    sub = region_year[region_year["Region"] == region].copy()
+    sub     = pop_long[pop_long["Region"] == region].copy()
+    X_all   = sub[["Year"]]
+    y_all   = sub["Population"]
+    X_train = sub[sub["Year"] <= TRAIN_CUTOFF][["Year"]]
+    y_train = sub[sub["Year"] <= TRAIN_CUTOFF]["Population"]
+    X_test  = sub[sub["Year"] > TRAIN_CUTOFF][["Year"]]
+    y_test  = sub[sub["Year"] > TRAIN_CUTOFF]["Population"]
 
-    X = sub[["Year"]]
-    y = sub["Total_Population"]
-
-    # Train/test split: train on 2010–2019, test on 2020–2022
-    X_train = sub[sub["Year"] <= 2019][["Year"]]
-    y_train = sub[sub["Year"] <= 2019]["Total_Population"]
-    X_test  = sub[sub["Year"] >= 2020][["Year"]]
-    y_test  = sub[sub["Year"] >= 2020]["Total_Population"]
-
-    # --- Linear Regression ---
-    lr = LinearRegression()
-    lr.fit(X_train, y_train)
-    lr_pred_test = lr.predict(X_test)
-    lr_rmse = np.sqrt(mean_squared_error(y_test, lr_pred_test))
-    lr_r2   = r2_score(y_test, lr_pred_test)
-
-    # --- Ridge Regression ---
-    ridge = Ridge(alpha=1.0)
-    ridge.fit(X_train, y_train)
-    ridge_pred_test = ridge.predict(X_test)
-    ridge_rmse = np.sqrt(mean_squared_error(y_test, ridge_pred_test))
-    ridge_r2   = r2_score(y_test, ridge_pred_test)
-
-    print(f"{region}:")
-    print(f"  Linear Regression → RMSE: {lr_rmse:,.0f}  | R²: {lr_r2:.4f}")
-    print(f"  Ridge Regression  → RMSE: {ridge_rmse:,.0f}  | R²: {ridge_r2:.4f}")
-
-    # XGBoost (if available) — needs more data to shine, but include for comparison
+    models = {
+        "LinearRegression": LinearRegression(),
+        "Ridge":            Ridge(alpha=1.0),
+    }
     if HAS_XGB:
-        xgb = XGBRegressor(n_estimators=50, max_depth=3, random_state=42, verbosity=0)
-        xgb.fit(X_train, y_train)
-        xgb_pred_test = xgb.predict(X_test)
-        xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_pred_test))
-        xgb_r2   = r2_score(y_test, xgb_pred_test)
-        print(f"  XGBoost           → RMSE: {xgb_rmse:,.0f}  | R²: {xgb_r2:.4f}")
+        models["XGBoost"] = XGBRegressor(n_estimators=50, max_depth=2,
+                                          learning_rate=0.1, random_state=42,
+                                          verbosity=0)
 
-    # Use LinearRegression (best for smooth trends) to forecast future years
-    lr_full = LinearRegression()
-    lr_full.fit(X, y)
+    print(f"\n{region}:")
+    best_rmse  = np.inf
+    best_model = None
 
-    future_X = pd.DataFrame({"Year": future_years_list})
-    preds = lr_full.predict(future_X)
+    for name, mdl in models.items():
+        mdl.fit(X_train, y_train)
+        preds = mdl.predict(X_test)
+        rmse  = np.sqrt(mean_squared_error(y_test, preds))
+        mae   = mean_absolute_error(y_test, preds)
+        mape  = np.mean(np.abs((y_test.values - preds) / y_test.values)) * 100
+        r2    = r2_score(y_test, preds)
+        print(f"  {name:<22} RMSE={rmse:>10,.0f}  MAE={mae:>10,.0f}  "
+              f"MAPE={mape:>5.2f}%  R2={r2:.4f}")
+        results_rows.append({"Region": region, "Model": name,
+                              "RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2})
+        if rmse < best_rmse:
+            best_rmse  = rmse
+            best_model = name
 
-    future_df = pd.DataFrame({
-        "Region":               region,
-        "Year":                 future_years_list,
-        "Predicted_Population": preds.astype(int)
-    })
-    all_preds.append(future_df)
+    print(f"  --> Best model on test set: {best_model}")
 
-future_population = pd.concat(all_preds, ignore_index=True)
+    # Refit Linear Regression on ALL data for forecasting
+    # (LinearRegression is best for smooth monotonic trends like population)
+    final_model = LinearRegression()
+    final_model.fit(X_all, y_all)
+    future_X     = pd.DataFrame({"Year": FUTURE_YEARS})
+    preds_future = final_model.predict(future_X).astype(int)
 
-print("\n── Future Population Predictions (Linear Regression) ──")
-print(future_population.pivot(index="Region", columns="Year", values="Predicted_Population").to_string())
+    for yr, pred in zip(FUTURE_YEARS, preds_future):
+        all_forecasts.append({"Region": region, "Year": yr,
+                               "Predicted_Population": max(pred, 0)})
 
-# ── 7. VISUALIZE FORECASTS ───────────────────────────────────────────────────
+# Summary
+eval_df = pd.DataFrame(results_rows)
+print("\n\nSUMMARY - Average metrics across all regions:")
+print(eval_df.groupby("Model")[["RMSE", "MAE", "MAPE", "R2"]].mean().round(3).to_string())
+
+future_pop = pd.DataFrame(all_forecasts)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 – FORECAST VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 fig, axes = plt.subplots(4, 4, figsize=(22, 18))
 axes = axes.flatten()
 
 for i, region in enumerate(regions):
-    hist = region_year[region_year["Region"] == region]
-    fcast = future_population[future_population["Region"] == region]
+    hist  = pop_long[pop_long["Region"] == region]
+    fcast = future_pop[future_pop["Region"] == region]
 
-    axes[i].plot(hist["Year"], hist["Total_Population"] / 1e6,
-                 marker="o", label="Historical", linewidth=2, color="steelblue")
+    axes[i].plot(hist["Year"], hist["Population"] / 1e6,
+                 marker="o", linewidth=2, label="Historical", color="steelblue")
     axes[i].plot(fcast["Year"], fcast["Predicted_Population"] / 1e6,
-                 marker="s", linestyle="--", label="Forecast", linewidth=2, color="tomato")
-    axes[i].axvline(2022.5, color="gray", linestyle=":", alpha=0.7)
-    axes[i].set_title(region, fontsize=9)
+                 marker="s", linestyle="--", linewidth=2, label="Forecast", color="tomato")
+    axes[i].axvspan(2022.5, 2030.5, alpha=0.05, color="tomato")
+    axes[i].axvline(2022.5, color="gray", linestyle=":", linewidth=1)
+    axes[i].set_title(region, fontsize=9, fontweight="bold")
     axes[i].set_xlabel("Year", fontsize=8)
     axes[i].set_ylabel("Population (M)", fontsize=8)
     axes[i].legend(fontsize=7)
     axes[i].grid(True, alpha=0.3)
+    axes[i].tick_params(labelsize=7)
 
 for j in range(len(regions), len(axes)):
     axes[j].set_visible(False)
 
-plt.suptitle("Population Forecast per Region (2023–2030)", fontsize=14, fontweight="bold")
+plt.suptitle("Population Forecast per Region - Linear Regression (2023-2030)",
+             fontsize=13, fontweight="bold")
 plt.tight_layout()
 plt.savefig("forecast_population_per_region.png", dpi=120, bbox_inches="tight")
 plt.close()
 print("\nSaved: forecast_population_per_region.png")
 
-# ── 8. EXPORT CLEANED + FORECAST DATA ────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 – BUILD MERGED DATASET (ready for bed demand model)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Save cleaned historical data
-region_year.to_csv("population_cleaned.csv", index=False, encoding="utf-8-sig")
-print("Saved: population_cleaned.csv")
+# Combine historical + forecast population into one table
+hist_pop           = pop_long[["Region", "Year", "Population"]].copy()
+hist_pop["Is_forecast"] = False
 
-# Save forecasts
-future_population.to_csv("population_forecast_2023_2030.csv", index=False, encoding="utf-8-sig")
-print("Saved: population_forecast_2023_2030.csv")
+fcast_pop          = future_pop.rename(columns={"Predicted_Population": "Population"}).copy()
+fcast_pop["Is_forecast"] = True
 
-print("\n✓ Preprocessing complete.")
-print("Next step: merge population_forecast_2023_2030.csv with hospital bed datasets")
-print("           and train the bed-demand prediction model.")
+full_pop = pd.concat([hist_pop, fcast_pop], ignore_index=True)
+
+# Merge in bed / hospital metrics (snapshot data used as baseline for all years)
+merged = full_pop.merge(b1000,  on="Region", how="left")
+merged = merged.merge(h10000,   on="Region", how="left")
+merged = merged.merge(
+    spec[["Region", "Total_Beds", "Intensive care", "Pediatrics",
+          "Obstetrics and gynecology", "Psychiatry and Neurology"]],
+    on="Region", how="left"
+)
+
+# Derived demand estimates
+merged["Beds_needed_estimate"]    = (merged["Population"] / 1000) * merged["Beds_per_1000"]
+merged["Hospitals_estimate"]      = (merged["Population"] / 10000) * merged["Hospitals_per_10000"]
+
+merged = merged.sort_values(["Region", "Year"]).reset_index(drop=True)
+
+print("\n\nMERGED DATASET (first 10 rows):")
+print(merged.head(10).to_string(index=False))
+print(f"\nFull shape: {merged.shape}")
+print("\nColumns:", list(merged.columns))
+print("\nNull values per column:")
+print(merged.isnull().sum())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 – EXPORT ALL OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+pop_long.to_csv("population_cleaned.csv",            index=False, encoding="utf-8-sig")
+future_pop.to_csv("population_forecast_2023_2030.csv", index=False, encoding="utf-8-sig")
+merged.to_csv("merged_dataset.csv",                  index=False, encoding="utf-8-sig")
+eval_df.to_csv("model_evaluation_population.csv",    index=False, encoding="utf-8-sig")
+
+print("\n\n" + "=" * 60)
+print("DONE. Output files:")
+print("  population_cleaned.csv")
+print("  population_forecast_2023_2030.csv")
+print("  merged_dataset.csv            <-- use this for the bed demand model")
+print("  model_evaluation_population.csv")
+print("  eda_population_trends.png")
+print("  eda_all_regions_overlay.png")
+print("  eda_population_2022_bar.png")
+print("  eda_growth_rate_heatmap.png")
+print("  eda_beds_vs_hospitals.png")
+print("  eda_specialty_beds_stacked.png")
+print("  forecast_population_per_region.png")
+print("=" * 60)
+print("\nNext step: use merged_dataset.csv to train the bed demand prediction model.")
